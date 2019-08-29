@@ -76,9 +76,8 @@ impl<S: PeerAddr, T: PeerAddr> PeerAddr for Stream<S, T> {
 }
 
 impl<S: AsyncRead, T: AsyncRead> AsyncRead for Stream<S, T> {
-    unsafe fn prepare_uninitialized_buffer(self: Pin<&mut Self>, buf: &mut [u8]) -> bool {
-        let stream = self.get_unchecked_mut();
-        match stream {
+    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [u8]) -> bool {
+        match *self {
             Stream::Plain(ref s) => s.prepare_uninitialized_buffer(buf),
             Stream::Tls(ref s) => s.prepare_uninitialized_buffer(buf),
         }

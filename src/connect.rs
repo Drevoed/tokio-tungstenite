@@ -35,7 +35,7 @@ mod encryption {
     use std::io::{Read, Result as IoResult, Write};
     use std::net::SocketAddr;
 
-    use futures::{future, Future, FutureExt};
+    use futures::{future, Future, FutureExt, TryFutureExt, TryFuture, TryStreamExt};
     use tokio_io::{AsyncRead, AsyncWrite};
 
     use tungstenite::stream::Mode;
@@ -64,19 +64,18 @@ mod encryption {
         socket: S,
         domain: String,
         mode: Mode,
-    ) -> Box<dyn Future<Output = Result<AutoStream<S>, Error>> + Send>
+    ) -> impl Future<Output = Result<AutoStream<S>, Error>>
     where
-        S: AsyncRead + AsyncWrite + Send,
+        S: AsyncRead + AsyncWrite
     {
         match mode {
-            Mode::Plain => Box::new(future::ok(StreamSwitcher::Plain(socket))),
-            Mode::Tls => Box::new(
+            Mode::Plain => future::ok(StreamSwitcher::Plain(socket)),
+            Mode::Tls =>
                 future::ready(TlsConnector::new())
-                    .map(TokioTlsConnector::from)
+                    .map_ok(TokioTlsConnector::from)
                     .and_then(move |connector| connector.connect(&domain, socket))
-                    .map(StreamSwitcher::Tls)
+                    .map_ok(StreamSwitcher::Tls)
                     .map_err(Error::Tls),
-            ),
         }
     }
 }
@@ -98,21 +97,22 @@ mod encryption {
         socket: S,
         _domain: String,
         mode: Mode,
-    ) -> Box<dyn Future<Output = Result<AutoStream<S>, Error>> + Send>
+    ) -> impl Future<Output = Result<AutoStream<S>, Error>>
     where
-        S: AsyncRead + AsyncWrite + Send,
+        S: AsyncRead + AsyncWrite
     {
         match mode {
-            Mode::Plain => Box::new(future::ok(socket)),
-            Mode::Tls => Box::new(future::err(Error::Url(
+            Mode::Plain => future::ok(socket),
+            Mode::Tls => future::err(Error::Url(
                 "TLS support not compiled in.".into(),
-            ))),
+            )),
         }
     }
 }
 
 use self::encryption::{wrap_stream, AutoStream};
-use std::pin::Pin;
+use std::io::Write;
+use std::io::Read;
 
 /// Get a domain from an URL.
 #[inline]
@@ -128,43 +128,40 @@ fn domain(request: &Request) -> Result<String, Error> {
 pub fn client_async_tls<R, S>(
     request: R,
     stream: S,
-) -> Pin<Box<dyn Future<Output = Result<(WebSocketStream<AutoStream<S>>, Response), Error>> + Send>>
+) -> impl Future<Output = Result<(WebSocketStream<AutoStream<S>>, Response), Error>>
 where
     R: Into<Request<'static>>,
-    S: AsyncRead + AsyncWrite + NoDelay + Send,
+    S: AsyncRead + AsyncWrite + Read + Write + NoDelay,
 {
     let request: Request = request.into();
 
     let domain = match domain(&request) {
         Ok(domain) => domain,
-        Err(err) => return Pin::new(Box::new(future::err(err))),
+        Err(err) => return future::err(err),
     };
 
     // Make sure we check domain and mode first. URL must be valid.
     let mode = match url_mode(&request.url) {
         Ok(m) => m,
-        Err(e) => return Box::new(future::err(e)),
+        Err(e) => return future::err(e),
     };
 
-    unsafe {
-        Pin::new_unchecked(
-            Box::new(
-                wrap_stream(stream, domain, mode)
-                    .and_then(|mut stream| {
-                        NoDelay::set_nodelay(&mut stream, true)
-                            .map(move |()| stream)
-                            .map_err(|e| e.into())
-                    })
-                    .and_then(move |stream| client_async(request, stream)),
-            )
-        )
-    }
+    let _:() = wrap_stream(stream, domain, mode);
+
+    wrap_stream(stream, domain, mode)
+        .and_then(|mut stream| {
+            NoDelay::set_nodelay(&mut stream, true)
+                .map(move |()| stream)
+                .map_err(|e| e.into());
+            future::ready(stream)
+        })
+        .and_then(move |stream| client_async(request, stream))
 }
 
 /// Connect to a given URL.
 pub fn connect_async<R>(
     request: R,
-) -> Box<dyn Future<Output = Result<(WebSocketStream<AutoStream<TcpStream>>, Response), Error>> + Send>
+) -> impl Future<Output = Result<(WebSocketStream<AutoStream<TcpStream>>, Response), Error>>
 where
     R: Into<Request<'static>>,
 {
@@ -172,16 +169,14 @@ where
 
     let domain = match domain(&request) {
         Ok(domain) => domain,
-        Err(err) => return Box::new(future::err(err)),
+        Err(err) => future::err(err),
     };
     let port = request
         .url
         .port_or_known_default()
         .expect("Bug: port unknown");
 
-    Box::new(
-        tokio_dns::TcpStream::connect((domain.as_str(), port))
-            .map_err(|e| e.into())
-            .and_then(move |socket| client_async_tls(request, socket)),
-    )
+    tokio_dns::TcpStream::connect((domain.as_str(), port))
+        .map_err(|e| e.into())
+        .and_then(move |socket| client_async_tls(request, socket))
 }

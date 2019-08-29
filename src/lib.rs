@@ -201,7 +201,7 @@ impl<S: PeerAddr> PeerAddr for WebSocketStream<S> {
 
 impl<T> Stream for WebSocketStream<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Read + Write,
 {
     type Item = Result<Message, WsError>;
 
@@ -219,24 +219,24 @@ where
 
 impl<T> Sink<Message> for WebSocketStream<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Read + Write,
 {
     type Error = WsError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.write_pending().into_async()
+        self.inner().write_pending().into_async()
     }
 
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-        self.inner.write_message(item)
+        self.inner().write_message(item)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
-        self.inner.write_pending().into_async()
+        self.inner().write_pending().into_async()
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
-        self.inner.close(None).into_async()
+        self.inner().close(None).into_async()
     }
 }
 
@@ -256,8 +256,7 @@ impl<S: AsyncRead + AsyncWrite + Read + Write> Future for ConnectAsync<S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.inner().poll(cx)? {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok((ws, resp))) => Poll::Ready(Ok((WebSocketStream::new(ws), resp))),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e))
+            Poll::Ready((ws, resp)) => Poll::Ready(Ok((WebSocketStream::new(ws), resp))),
         }
     }
 }
