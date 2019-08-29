@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 use bytes::{Buf, BufMut};
 use futures::Poll;
 use tokio_io::{AsyncRead, AsyncWrite};
+use futures::task::Context;
+use std::pin::Pin;
 
 /// Trait to switch TCP_NODELAY.
 pub trait NoDelay {
@@ -74,31 +76,61 @@ impl<S: PeerAddr, T: PeerAddr> PeerAddr for Stream<S, T> {
 }
 
 impl<S: AsyncRead, T: AsyncRead> AsyncRead for Stream<S, T> {
-    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [u8]) -> bool {
-        match *self {
+    unsafe fn prepare_uninitialized_buffer(self: Pin<&mut Self>, buf: &mut [u8]) -> bool {
+        let stream = self.get_unchecked_mut();
+        match stream {
             Stream::Plain(ref s) => s.prepare_uninitialized_buffer(buf),
             Stream::Tls(ref s) => s.prepare_uninitialized_buffer(buf),
         }
     }
-    fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, IoError> {
-        match *self {
-            Stream::Plain(ref mut s) => s.read_buf(buf),
-            Stream::Tls(ref mut s) => s.read_buf(buf),
+
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, IoError>> {
+        let stream = unsafe { self.get_unchecked_mut() };
+        match stream {
+            Stream::Plain(ref mut s) => unsafe {Pin::new_unchecked(s).poll_read(cx, buf)},
+            Stream::Tls(ref mut s) => unsafe {Pin::new_unchecked(s).poll_read(cx, buf)},
+        }
+    }
+
+    fn poll_read_buf<B: BufMut>(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<Result<usize, IoError>> {
+        let stream = unsafe { self.get_unchecked_mut() };
+        match stream {
+            Stream::Plain(ref mut s) => unsafe {Pin::new_unchecked(s).poll_read_buf(cx, buf)},
+            Stream::Tls(ref mut s) => unsafe {Pin::new_unchecked(s).poll_read_buf(cx, buf)},
         }
     }
 }
 
 impl<S: AsyncWrite, T: AsyncWrite> AsyncWrite for Stream<S, T> {
-    fn shutdown(&mut self) -> Poll<(), IoError> {
-        match *self {
-            Stream::Plain(ref mut s) => s.shutdown(),
-            Stream::Tls(ref mut s) => s.shutdown(),
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, IoError>> {
+        let stream = unsafe { self.get_unchecked_mut() };
+        match stream {
+            Stream::Plain(ref mut s) => unsafe {Pin::new_unchecked(s).poll_write(cx, buf)},
+            Stream::Tls(ref mut s) => unsafe {Pin::new_unchecked(s).poll_write(cx, buf) },
         }
     }
-    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, IoError> {
-        match *self {
-            Stream::Plain(ref mut s) => s.write_buf(buf),
-            Stream::Tls(ref mut s) => s.write_buf(buf),
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        let stream = unsafe { self.get_unchecked_mut() };
+        match stream {
+            Stream::Plain(ref mut s) => unsafe {Pin::new_unchecked(s).poll_flush(cx)},
+            Stream::Tls(ref mut s) => unsafe {Pin::new_unchecked(s).poll_flush(cx)},
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        let stream = unsafe { self.get_unchecked_mut() };
+        match stream {
+            Stream::Plain(ref mut s) => unsafe {Pin::new_unchecked(s).poll_shutdown(cx)},
+            Stream::Tls(ref mut s) => unsafe {Pin::new_unchecked(s).poll_shutdown(cx)},
+        }
+    }
+
+    fn poll_write_buf<B: Buf>(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<Result<usize, IoError>> {
+        let stream = unsafe { self.get_unchecked_mut() };
+        match stream {
+            Stream::Plain(ref mut s) => unsafe {Pin::new_unchecked(s).poll_write_buf(cx, buf)},
+            Stream::Tls(ref mut s) => unsafe {Pin::new_unchecked(s).poll_write_buf(cx, buf)},
         }
     }
 }

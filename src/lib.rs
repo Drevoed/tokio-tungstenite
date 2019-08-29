@@ -29,7 +29,10 @@ use std::io::ErrorKind;
 #[cfg(feature = "stream")]
 use std::{io::Result as IoResult, net::SocketAddr};
 
-use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
+use futures::{
+    Future, Poll, Sink, Stream, task::Context
+};
+use std::pin::Pin;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use tungstenite::{
@@ -51,6 +54,7 @@ pub use stream::PeerAddr;
 
 #[cfg(all(feature = "connect", feature = "tls"))]
 pub use connect::MaybeTlsStream;
+use std::io::{Read, Write};
 
 /// Creates a WebSocket handshake from a request and a stream.
 /// For convenience, the user may call this with a url string, a URL,
@@ -67,7 +71,7 @@ pub use connect::MaybeTlsStream;
 pub fn client_async<'a, R, S>(request: R, stream: S) -> ConnectAsync<S>
 where
     R: Into<Request<'a>>,
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Read + Write,
 {
     client_async_with_config(request, stream, None)
 }
@@ -81,7 +85,7 @@ pub fn client_async_with_config<'a, R, S>(
 ) -> ConnectAsync<S>
 where
     R: Into<Request<'a>>,
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Read + Write,
 {
     ConnectAsync {
         inner: MidHandshake {
@@ -103,7 +107,7 @@ where
 /// the server half of the accepting a client's websocket connection.
 pub fn accept_async<S>(stream: S) -> AcceptAsync<S, NoCallback>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Read + Write,
 {
     accept_hdr_async(stream, NoCallback)
 }
@@ -115,7 +119,7 @@ pub fn accept_async_with_config<S>(
     config: Option<WebSocketConfig>,
 ) -> AcceptAsync<S, NoCallback>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Read + Write,
 {
     accept_hdr_async_with_config(stream, NoCallback, config)
 }
@@ -127,7 +131,7 @@ where
 /// requests and is able to add extra headers to the reply.
 pub fn accept_hdr_async<S, C>(stream: S, callback: C) -> AcceptAsync<S, C>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Read + Write,
     C: Callback,
 {
     accept_hdr_async_with_config(stream, callback, None)
@@ -141,7 +145,7 @@ pub fn accept_hdr_async_with_config<S, C>(
     config: Option<WebSocketConfig>,
 ) -> AcceptAsync<S, C>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Read + Write,
     C: Callback,
 {
     AcceptAsync {
@@ -165,6 +169,7 @@ pub struct WebSocketStream<S> {
 }
 
 impl<S> WebSocketStream<S> {
+    pin_utils::unsafe_unpinned!(inner: WebSocket<S>);
     /// Convert a raw socket into a WebSocketStream without performing a
     /// handshake.
     pub fn from_raw_socket(stream: S, role: Role, config: Option<WebSocketConfig>) -> Self {
@@ -198,73 +203,82 @@ impl<T> Stream for WebSocketStream<T>
 where
     T: AsyncRead + AsyncWrite,
 {
-    type Item = Message;
-    type Error = WsError;
+    type Item = Result<Message, WsError>;
 
-    fn poll(&mut self) -> Poll<Option<Message>, WsError> {
-        self.inner
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.inner()
             .read_message()
             .map(Some)
-            .to_async()
+            .into_async()
             .or_else(|err| match err {
-                WsError::ConnectionClosed => Ok(Async::Ready(None)),
-                err => Err(err),
+                WsError::ConnectionClosed => Ok(Poll::Ready(None)),
+                err => Err(err)
             })
     }
 }
 
-impl<T> Sink for WebSocketStream<T>
+impl<T> Sink<Message> for WebSocketStream<T>
 where
     T: AsyncRead + AsyncWrite,
 {
-    type SinkItem = Message;
-    type SinkError = WsError;
+    type Error = WsError;
 
-    fn start_send(&mut self, item: Message) -> StartSend<Message, WsError> {
-        self.inner.write_message(item).to_start_send()
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.write_pending().into_async()
     }
 
-    fn poll_complete(&mut self) -> Poll<(), WsError> {
-        self.inner.write_pending().to_async()
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.inner.write_message(item)
     }
 
-    fn close(&mut self) -> Poll<(), WsError> {
-        self.inner.close(None).to_async()
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.inner.write_pending().into_async()
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.inner.close(None).into_async()
     }
 }
 
 /// Future returned from client_async() which will resolve
 /// once the connection handshake has finished.
-pub struct ConnectAsync<S: AsyncRead + AsyncWrite> {
+pub struct ConnectAsync<S: AsyncRead + AsyncWrite + Read + Write> {
     inner: MidHandshake<ClientHandshake<S>>,
 }
 
-impl<S: AsyncRead + AsyncWrite> Future for ConnectAsync<S> {
-    type Item = (WebSocketStream<S>, Response);
-    type Error = WsError;
+impl<S: AsyncRead + AsyncWrite + Read + Write> ConnectAsync<S> {
+    pin_utils::unsafe_pinned!(inner: MidHandshake<ClientHandshake<S>>);
+}
 
-    fn poll(&mut self) -> Poll<Self::Item, WsError> {
-        match self.inner.poll()? {
-            Async::NotReady => Ok(Async::NotReady),
-            Async::Ready((ws, resp)) => Ok(Async::Ready((WebSocketStream::new(ws), resp))),
+impl<S: AsyncRead + AsyncWrite + Read + Write> Future for ConnectAsync<S> {
+    type Output = Result<(WebSocketStream<S>, Response), WsError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.inner().poll(cx)? {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok((ws, resp))) => Poll::Ready(Ok((WebSocketStream::new(ws), resp))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e))
         }
     }
 }
 
 /// Future returned from accept_async() which will resolve
 /// once the connection handshake has finished.
-pub struct AcceptAsync<S: AsyncRead + AsyncWrite, C: Callback> {
+pub struct AcceptAsync<S: AsyncRead + AsyncWrite + Read + Write, C: Callback> {
     inner: MidHandshake<ServerHandshake<S, C>>,
 }
 
-impl<S: AsyncRead + AsyncWrite, C: Callback> Future for AcceptAsync<S, C> {
-    type Item = WebSocketStream<S>;
-    type Error = WsError;
+impl<S: AsyncRead + AsyncWrite + Read + Write, C: Callback> AcceptAsync<S, C> {
+    pin_utils::unsafe_pinned!(inner: MidHandshake<ServerHandshake<S, C>>);
+}
 
-    fn poll(&mut self) -> Poll<Self::Item, WsError> {
-        match self.inner.poll()? {
-            Async::NotReady => Ok(Async::NotReady),
-            Async::Ready(ws) => Ok(Async::Ready(WebSocketStream::new(ws))),
+impl<S: AsyncRead + AsyncWrite + Read + Write, C: Callback> Future for AcceptAsync<S, C> {
+    type Output = Result<WebSocketStream<S>, WsError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.inner().poll(cx)? {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(ws) => Poll::Ready(Ok(WebSocketStream::new(ws)))
         }
     }
 }
@@ -273,62 +287,42 @@ struct MidHandshake<H: HandshakeRole> {
     inner: Option<Result<<H as HandshakeRole>::FinalResult, HandshakeError<H>>>,
 }
 
-impl<H: HandshakeRole> Future for MidHandshake<H> {
-    type Item = <H as HandshakeRole>::FinalResult;
-    type Error = WsError;
+impl<H: HandshakeRole> MidHandshake<H> {
+    pin_utils::unsafe_unpinned!(inner: Option<Result<<H as HandshakeRole>::FinalResult, HandshakeError<H>>>);
+}
 
-    fn poll(&mut self) -> Poll<Self::Item, WsError> {
-        match self.inner.take().expect("cannot poll MidHandshake twice") {
-            Ok(result) => Ok(Async::Ready(result)),
-            Err(HandshakeError::Failure(e)) => Err(e),
+impl<H: HandshakeRole> Future for MidHandshake<H> {
+    type Output = Result<<H as HandshakeRole>::FinalResult, WsError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.inner().take().expect("cannot poll MidHandshake twice") {
+            Ok(result) => Poll::Ready(Ok(result)),
+            Err(HandshakeError::Failure(e)) => Poll::Ready(Err(e)),
             Err(HandshakeError::Interrupted(s)) => match s.handshake() {
-                Ok(result) => Ok(Async::Ready(result)),
-                Err(HandshakeError::Failure(e)) => Err(e),
+                Ok(result) => Poll::Ready(Ok(result)),
+                Err(HandshakeError::Failure(e)) => Poll::Ready(Err(e)),
                 Err(HandshakeError::Interrupted(s)) => {
                     self.inner = Some(Err(HandshakeError::Interrupted(s)));
-                    Ok(Async::NotReady)
+                    Poll::Pending
                 }
             },
         }
     }
 }
 
-trait ToAsync {
-    type T;
-    type E;
-    fn to_async(self) -> Result<Async<Self::T>, Self::E>;
+trait IntoAsync {
+    type O;
+    fn into_async(self) -> Poll<Self::O>;
 }
 
-impl<T> ToAsync for Result<T, WsError> {
-    type T = T;
-    type E = WsError;
-    fn to_async(self) -> Result<Async<Self::T>, Self::E> {
+impl<T> IntoAsync for Result<T, WsError> {
+    type O = Result<T, WsError>;
+    fn into_async(self) -> Poll<Self::O> {
         match self {
-            Ok(x) => Ok(Async::Ready(x)),
+            Ok(x) => Poll::Ready(Ok(x)),
             Err(error) => match error {
-                WsError::Io(ref err) if err.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
-                err => Err(err),
-            },
-        }
-    }
-}
-
-trait ToStartSend {
-    type T;
-    type E;
-    fn to_start_send(self) -> StartSend<Self::T, Self::E>;
-}
-
-impl ToStartSend for Result<(), WsError> {
-    type T = Message;
-    type E = WsError;
-    fn to_start_send(self) -> StartSend<Self::T, Self::E> {
-        match self {
-            Ok(_) => Ok(AsyncSink::Ready),
-            Err(error) => match error {
-                WsError::Io(ref err) if err.kind() == ErrorKind::WouldBlock => Ok(AsyncSink::Ready),
-                WsError::SendQueueFull(msg) => Ok(AsyncSink::NotReady(msg)),
-                err => Err(err),
+                WsError::Io(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
+                err => Poll::Ready(Err(err)),
             },
         }
     }
