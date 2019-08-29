@@ -29,9 +29,7 @@ use std::io::ErrorKind;
 #[cfg(feature = "stream")]
 use std::{io::Result as IoResult, net::SocketAddr};
 
-use futures::{
-    Future, Poll, Sink, Stream, task::Context
-};
+use futures::{task::Context, Future, Poll, Sink, Stream, TryStreamExt, TryStream};
 use std::pin::Pin;
 use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -210,9 +208,12 @@ where
             .read_message()
             .map(Some)
             .into_async()
-            .or_else(|err| match err {
-                WsError::ConnectionClosed => Ok(Poll::Ready(None)),
-                err => Err(err)
+            .map(|res| {
+                res.or_else(|err| match err {
+                    WsError::ConnectionClosed => Ok(None),
+                    err => Err(err)
+                })
+                    .transpose()
             })
     }
 }
@@ -277,7 +278,7 @@ impl<S: AsyncRead + AsyncWrite + Read + Write, C: Callback> Future for AcceptAsy
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.inner().poll(cx)? {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(ws) => Poll::Ready(Ok(WebSocketStream::new(ws)))
+            Poll::Ready(ws) => Poll::Ready(Ok(WebSocketStream::new(ws))),
         }
     }
 }
@@ -287,7 +288,9 @@ struct MidHandshake<H: HandshakeRole> {
 }
 
 impl<H: HandshakeRole> MidHandshake<H> {
-    pin_utils::unsafe_unpinned!(inner: Option<Result<<H as HandshakeRole>::FinalResult, HandshakeError<H>>>);
+    pin_utils::unsafe_unpinned!(
+        inner: Option<Result<<H as HandshakeRole>::FinalResult, HandshakeError<H>>>
+    );
 }
 
 impl<H: HandshakeRole> Future for MidHandshake<H> {
