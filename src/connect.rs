@@ -6,8 +6,7 @@ use std::net::SocketAddr;
 
 use tokio_net::tcp::TcpStream;
 
-use futures::{future, Future, TryFutureExt, AsyncWriteExt, Poll, task::Context};
-use futures::compat::{AsyncWrite01CompatExt, AsyncRead01CompatExt};
+use futures::{Poll, task::Context};
 use tokio_io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 use tungstenite::client::url_mode;
@@ -29,13 +28,13 @@ impl PeerAddr for TcpStream {
     }
 }
 
-pub(crate) struct ReadWriteWrapper<T: AsyncRead + AsyncWrite> {
+pub struct ReadWriteWrapper<T> {
     inner: T
 }
 
 impl<T: AsyncRead + AsyncWrite> ReadWriteWrapper<T> {
     pin_utils::unsafe_pinned!(inner: T);
-    pub(crate) fn new(s: T) -> Self {
+    pub(crate) fn new(inner: T) -> Self {
         ReadWriteWrapper {
             inner
         }
@@ -46,23 +45,23 @@ impl<T: AsyncRead + AsyncWrite> ReadWriteWrapper<T> {
     }
 }
 
-impl<T: Read> Read for ReadWriteWrapper<T> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+impl<T: AsyncRead + AsyncWrite + Unpin> Read for ReadWriteWrapper<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         block_on(self.inner.read(buf))
     }
 }
 
-impl<T: Write> Write for ReadWriteWrapper<T> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+impl<T: AsyncRead + AsyncWrite + Unpin> Write for ReadWriteWrapper<T> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         block_on(self.inner.write(buf))
     }
 
-    fn flush(&mut self) -> Result<(), Error> {
+    fn flush(&mut self) -> Result<(), io::Error> {
         block_on(self.inner.flush())
     }
 }
 
-impl<T: AsyncWrite> AsyncWrite for ReadWriteWrapper<T> {
+impl<T: AsyncRead + AsyncWrite> AsyncWrite for ReadWriteWrapper<T> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
         self.inner().poll_write(cx, buf)
     }
@@ -76,7 +75,7 @@ impl<T: AsyncWrite> AsyncWrite for ReadWriteWrapper<T> {
     }
 }
 
-impl<T: AsyncRead> AsyncRead for ReadWriteWrapper<T> {
+impl<T: AsyncRead + AsyncWrite> AsyncRead for ReadWriteWrapper<T> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, io::Error>> {
         self.inner().poll_read(cx, buf)
     }
@@ -87,16 +86,12 @@ mod encryption {
     use native_tls::TlsConnector;
     use tokio_tls::{TlsConnector as TokioTlsConnector, TlsStream};
 
-    use std::io::{Read, Result as IoResult, Write};
-    use std::net::SocketAddr;
-
     use tokio_io::{AsyncRead, AsyncWrite};
 
     use tungstenite::stream::Mode;
     use tungstenite::Error;
 
-    use crate::stream::{NoDelay, PeerAddr, Stream as StreamSwitcher};
-    use futures::future::Either;
+    use crate::stream::Stream as StreamSwitcher;
     use crate::connect::ReadWriteWrapper;
 
     /// A stream that might be protected with TLS.
@@ -104,19 +99,13 @@ mod encryption {
 
     pub type AutoStream<S> = MaybeTlsStream<S>;
 
-    impl<T: Read + Write + NoDelay> NoDelay for TlsStream<T> {
-        fn set_nodelay(&mut self, nodelay: bool) -> IoResult<()> {
-            self.get_mut().get_mut().set_nodelay(nodelay)
-        }
-    }
-
     pub async fn wrap_stream<S>(
         socket: ReadWriteWrapper<S>,
         domain: String,
         mode: Mode,
     ) -> Result<AutoStream<S>, Error>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Read + Write,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         match mode {
             Mode::Plain => Ok(StreamSwitcher::Plain(socket)),
@@ -165,10 +154,7 @@ mod encryption {
 use self::encryption::{wrap_stream, AutoStream};
 use std::io::Read;
 use std::io::Write;
-use futures::future::Either;
 use futures::executor::block_on;
-use tokio_tls::TlsStream;
-use crate::stream::Stream;
 use std::pin::Pin;
 
 /// Get a domain from an URL.
@@ -203,14 +189,7 @@ where
         Err(e) => return Err(e),
     };
 
-    let stream = wrap_stream(ReadWriteWrapper::new(stream), domain, mode).await;
-    let res: Result<Result<AutoStream<S>, Error>, Error> = stream.map(|mut stream| {
-        NoDelay::set_nodelay(&mut stream, true)
-            .map(move |()| stream)
-            .map_err(|e| e.into())
-    });
-    let res = res?;
-    let stream = res?;
+    let stream = wrap_stream(ReadWriteWrapper::new(stream), domain, mode).await?;
     client_async(request, stream).await
 }
 
@@ -236,5 +215,12 @@ where
         .await
         .map_err(|e| e.into());
     let socket = socket?;
+    client_async_tls(request, socket).await
+}
+/// Do
+pub async fn connect_async_ip_secure<R: Into<Request<'static>>>(request: R, host: &str) -> Result<(WebSocketStream<AutoStream<TcpStream>>, Response), Error> {
+    let addr = &format!("{}:443", host).parse().unwrap();
+    let request = request.into();
+    let socket = TcpStream::connect(addr).await.unwrap();
     client_async_tls(request, socket).await
 }

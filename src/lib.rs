@@ -29,7 +29,7 @@ use std::io::ErrorKind;
 #[cfg(feature = "stream")]
 use std::{io::Result as IoResult, net::SocketAddr};
 
-use futures::{task::Context, Future, Poll, Sink, Stream, TryStreamExt, TryStream};
+use futures::{task::Context, Future, Poll, Sink, Stream};
 use std::pin::Pin;
 use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -45,7 +45,7 @@ use tungstenite::{
 };
 
 #[cfg(feature = "connect")]
-pub use connect::{client_async_tls, connect_async};
+pub use connect::{client_async_tls, connect_async, connect_async_ip_secure};
 
 #[cfg(feature = "stream")]
 pub use stream::PeerAddr;
@@ -53,7 +53,6 @@ pub use stream::PeerAddr;
 #[cfg(all(feature = "connect", feature = "tls"))]
 pub use connect::MaybeTlsStream;
 use std::io::{Read, Write};
-use crate::connect::ReadWriteWrapper;
 
 /// Creates a WebSocket handshake from a request and a stream.
 /// For convenience, the user may call this with a url string, a URL,
@@ -70,7 +69,7 @@ use crate::connect::ReadWriteWrapper;
 pub fn client_async<'a, R, S>(request: R, stream: S) -> ConnectAsync<S>
 where
     R: Into<Request<'a>>,
-    S: AsyncRead + AsyncWrite + Read + Write
+    S: AsyncRead + AsyncWrite + Unpin + Read + Write
 {
     client_async_with_config(request, stream, None)
 }
@@ -81,14 +80,14 @@ pub fn client_async_with_config<'a, R, S>(
     request: R,
     stream: S,
     config: Option<WebSocketConfig>,
-) -> ConnectAsync<ReadWriteWrapper<S>>
+) -> ConnectAsync<S>
 where
     R: Into<Request<'a>>,
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Unpin + Read + Write,
 {
     ConnectAsync {
         inner: MidHandshake {
-            inner: Some(ClientHandshake::start(ReadWriteWrapper::new(stream), request.into(), config).handshake()),
+            inner: Some(ClientHandshake::start(stream, request.into(), config).handshake()),
         },
     }
 }
@@ -164,7 +163,7 @@ where
 /// them in `futures-rs` crate documentation or have a look on the examples
 /// and unit tests for this crate.
 pub struct WebSocketStream<S> {
-    inner: WebSocket<ReadWriteWrapper<S>>,
+    inner: WebSocket<S>,
 }
 
 impl<S> WebSocketStream<S> {
@@ -200,7 +199,7 @@ impl<S: PeerAddr> PeerAddr for WebSocketStream<S> {
 
 impl<T> Stream for WebSocketStream<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Read + Write,
 {
     type Item = Result<Message, WsError>;
 
@@ -244,15 +243,15 @@ where
 
 /// Future returned from client_async() which will resolve
 /// once the connection handshake has finished.
-pub struct ConnectAsync<S: AsyncRead + AsyncWrite> {
-    inner: MidHandshake<ClientHandshake<ReadWriteWrapper<S>>>,
+pub struct ConnectAsync<S: AsyncRead + AsyncWrite + Unpin + Read + Write> {
+    inner: MidHandshake<ClientHandshake<S>>,
 }
 
-impl<S: AsyncRead + AsyncWrite> ConnectAsync<S> {
-    pin_utils::unsafe_pinned!(inner: MidHandshake<ClientHandshake<ReadWriteWrapper<S>>>);
+impl<S: AsyncRead + AsyncWrite + Unpin + Read + Write> ConnectAsync<S> {
+    pin_utils::unsafe_pinned!(inner: MidHandshake<ClientHandshake<S>>);
 }
 
-impl<S: AsyncRead + AsyncWrite> Future for ConnectAsync<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin + Read + Write> Future for ConnectAsync<S> {
     type Output = Result<(WebSocketStream<S>, Response), WsError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -297,15 +296,16 @@ impl<H: HandshakeRole> MidHandshake<H> {
 impl<H: HandshakeRole> Future for MidHandshake<H> {
     type Output = Result<<H as HandshakeRole>::FinalResult, WsError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner().take().expect("cannot poll MidHandshake twice") {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.as_mut().inner().take().expect("cannot poll MidHandshake twice") {
             Ok(result) => Poll::Ready(Ok(result)),
             Err(HandshakeError::Failure(e)) => Poll::Ready(Err(e)),
             Err(HandshakeError::Interrupted(s)) => match s.handshake() {
                 Ok(result) => Poll::Ready(Ok(result)),
                 Err(HandshakeError::Failure(e)) => Poll::Ready(Err(e)),
                 Err(HandshakeError::Interrupted(s)) => {
-                    self.inner = Some(Err(HandshakeError::Interrupted(s)));
+                    let mut this = unsafe {self.get_unchecked_mut()};
+                    this.inner = Some(Err(HandshakeError::Interrupted(s)));
                     Poll::Pending
                 }
             },

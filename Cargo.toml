@@ -40,6 +40,7 @@ version = "0.2.0"
 [dependencies.tokio-dns-unofficial]
 optional = true
 git = "https://github.com/sbstp/tokio-dns.git"
+rev = "66e700f"
 
 [dependencies.tokio-net]
 optional = true
@@ -50,7 +51,7 @@ optional = true
 version = "0.3.0-alpha.2"
 
 [dev-dependencies]
-tokio = "0.1.7"
+tokio = "0.2.0-alpha.2"
 url = "2.0.0"
 env_logger = "0.6.1"
 log = "0.4.6"
