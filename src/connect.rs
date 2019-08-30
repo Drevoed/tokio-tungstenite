@@ -1,12 +1,14 @@
 //! Connection helper.
 
 use std::io::Result as IoResult;
+use std::io;
 use std::net::SocketAddr;
 
 use tokio_net::tcp::TcpStream;
 
-use futures::{future, Future, TryFutureExt};
-use tokio_io::{AsyncRead, AsyncWrite};
+use futures::{future, Future, TryFutureExt, AsyncWriteExt, Poll, task::Context};
+use futures::compat::{AsyncWrite01CompatExt, AsyncRead01CompatExt};
+use tokio_io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 use tungstenite::client::url_mode;
 use tungstenite::handshake::client::Response;
@@ -21,25 +23,62 @@ impl NoDelay for TcpStream {
     }
 }
 
-impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        unimplemented!()
-    }
-
-    fn flush(&mut self) -> Result<(), Error> {
-        unimplemented!()
-    }
-}
-
-impl Read for TcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        unimplemented!()
-    }
-}
-
 impl PeerAddr for TcpStream {
     fn peer_addr(&self) -> IoResult<SocketAddr> {
         self.peer_addr()
+    }
+}
+
+pub(crate) struct ReadWriteWrapper<T: AsyncRead + AsyncWrite> {
+    inner: T
+}
+
+impl<T: AsyncRead + AsyncWrite> ReadWriteWrapper<T> {
+    pin_utils::unsafe_pinned!(inner: T);
+    pub(crate) fn new(s: T) -> Self {
+        ReadWriteWrapper {
+            inner
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T: Read> Read for ReadWriteWrapper<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        block_on(self.inner.read(buf))
+    }
+}
+
+impl<T: Write> Write for ReadWriteWrapper<T> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        block_on(self.inner.write(buf))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        block_on(self.inner.flush())
+    }
+}
+
+impl<T: AsyncWrite> AsyncWrite for ReadWriteWrapper<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
+        self.inner().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.inner().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.inner().poll_shutdown(cx)
+    }
+}
+
+impl<T: AsyncRead> AsyncRead for ReadWriteWrapper<T> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, io::Error>> {
+        self.inner().poll_read(cx, buf)
     }
 }
 
@@ -58,9 +97,10 @@ mod encryption {
 
     use crate::stream::{NoDelay, PeerAddr, Stream as StreamSwitcher};
     use futures::future::Either;
+    use crate::connect::ReadWriteWrapper;
 
     /// A stream that might be protected with TLS.
-    pub type MaybeTlsStream<S> = StreamSwitcher<S, TlsStream<S>>;
+    pub type MaybeTlsStream<S> = StreamSwitcher<ReadWriteWrapper<S>, ReadWriteWrapper<TlsStream<S>>>;
 
     pub type AutoStream<S> = MaybeTlsStream<S>;
 
@@ -70,37 +110,22 @@ mod encryption {
         }
     }
 
-    impl<T: Write> Write for TlsStream<T> {
-        fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-            unimplemented!()
-        }
-
-        fn flush(&mut self) -> Result<(), Error> {
-            unimplemented!()
-        }
-    }
-
-    impl<T: Read> Read for TlsStream<T> {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-            unimplemented!()
-        }
-    }
-
     pub async fn wrap_stream<S>(
-        socket: S,
+        socket: ReadWriteWrapper<S>,
         domain: String,
         mode: Mode,
     ) -> Result<AutoStream<S>, Error>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Read + Write,
     {
         match mode {
             Mode::Plain => Ok(StreamSwitcher::Plain(socket)),
             Mode::Tls => {
                 let connector = TlsConnector::new().map(TokioTlsConnector::from).unwrap();
                 let stream = connector
-                    .connect(&domain, socket)
+                    .connect(&domain, socket.into_inner())
                     .await
+                    .map(ReadWriteWrapper::new)
                     .map(StreamSwitcher::Tls)
                     .map_err(Error::Tls);
                 stream
@@ -141,6 +166,10 @@ use self::encryption::{wrap_stream, AutoStream};
 use std::io::Read;
 use std::io::Write;
 use futures::future::Either;
+use futures::executor::block_on;
+use tokio_tls::TlsStream;
+use crate::stream::Stream;
+use std::pin::Pin;
 
 /// Get a domain from an URL.
 #[inline]
@@ -159,7 +188,7 @@ pub async fn client_async_tls<R, S>(
 ) -> Result<(WebSocketStream<AutoStream<S>>, Response), Error>
 where
     R: Into<Request<'static>>,
-    S: AsyncRead + AsyncWrite + Read + Write + NoDelay + Unpin,
+    S: AsyncRead + AsyncWrite + NoDelay + Unpin,
 {
     let request: Request = request.into();
 
@@ -174,7 +203,7 @@ where
         Err(e) => return Err(e),
     };
 
-    let stream = wrap_stream(stream, domain, mode).await;
+    let stream = wrap_stream(ReadWriteWrapper::new(stream), domain, mode).await;
     let res: Result<Result<AutoStream<S>, Error>, Error> = stream.map(|mut stream| {
         NoDelay::set_nodelay(&mut stream, true)
             .map(move |()| stream)

@@ -18,9 +18,12 @@ tls = ["tokio-tls", "native-tls", "stream", "tungstenite/tls"]
 stream = ["bytes"]
 
 [dependencies]
-futures-preview = "0.3.0-alpha.18"
 tokio-io = "0.2.0-alpha.2"
 pin-utils = "0.1.0-alpha.4"
+
+[dependencies.futures-preview]
+version = "0.3.0-alpha.18"
+features = ["io-compat"]
 
 [dependencies.tungstenite]
 version = "0.9.1"

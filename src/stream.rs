@@ -11,7 +11,7 @@ use bytes::{Buf, BufMut};
 use futures::task::Context;
 use futures::Poll;
 use std::pin::Pin;
-use tokio_io::{AsyncRead, AsyncWrite as FutAsyncWrite, AsyncRead as FutAsyncRead};
+use tokio_io::{AsyncRead, AsyncWrite, AsyncRead};
 
 /// Trait to switch TCP_NODELAY.
 pub trait NoDelay {
